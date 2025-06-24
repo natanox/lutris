@@ -7,7 +7,9 @@ from gi.repository import GObject, Gtk
 
 from lutris.gui.installer.widgets import InstallerLabel
 from lutris.gui.widgets.common import FileChooserEntry
+from lutris.gui.widgets.url_picker import UrlPicker
 from lutris.installer.installer_file_collection import InstallerFileCollection
+from lutris.installer.installer_file_source import SourceDownload
 from lutris.installer.steam_installer import SteamInstaller
 from lutris.util import system
 from lutris.util.log import logger
@@ -25,6 +27,13 @@ class InstallerFileBox(Gtk.VBox):
 
     def __init__(self, installer_file):
         super().__init__()
+        # Style related stuff
+        self.css_provider = Gtk.CssProvider()
+        self.css_provider.load_from_path("lutris/styles/file_box.css")
+        Gtk.StyleContext.add_provider_for_screen(
+            self.get_screen(), self.css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
         self.installer_file = installer_file
         self.cache_to_pga = self.installer_file.uses_pga_cache()
         self.started = False
@@ -35,7 +44,14 @@ class InstallerFileBox(Gtk.VBox):
         self.set_margin_right(12)
         self.provider = self.installer_file.default_provider
         self.file_provider_widget = None
-        self.spinner_widget = None
+        self.url_picker = None
+        self.spinner_widget = self.get_spinner_widget(16)
+        self.spinner_widget.stop()
+        self.installer_file.connect("processing-start", self.on_processing_start)
+        self.installer_file.connect("processing-stop", self.on_processing_stop)
+        self.combobox_widget = None
+        self.label = None
+
         self.add(self.get_widgets())
 
     @property
@@ -103,22 +119,11 @@ class InstallerFileBox(Gtk.VBox):
             model.append(["user", _("Select File")])
         return model
 
-    def get_combobox(self):
-        """Return the combobox widget to select file source"""
-        combobox = Gtk.ComboBox.new_with_model(self.get_combobox_model())
-        combobox.set_id_column(0)
-        renderer_text = Gtk.CellRendererText()
-        combobox.pack_start(renderer_text, True)
-        combobox.add_attribute(renderer_text, "text", 1)
-        combobox.connect("changed", self.on_source_changed)
-        combobox.set_active_id(self.provider)
-        return combobox
-
-    def replace_file_provider_widget(self, processing=False):
+    def replace_file_provider_widget(self):
         """
         Replace the file provider label and the source button with the actual widget.
-        Set processing to True to add a spinner to the widget.
         """
+        logger.debug("Replacing file provider widget: %s", self.file_provider_widget)
         self.file_provider_widget.destroy()
         if self.spinner_widget:
             self.spinner_widget.destroy()
@@ -131,15 +136,12 @@ class InstallerFileBox(Gtk.VBox):
                 child.destroy()
         else:
             self.file_provider_widget = self.get_file_provider_label()
-            self.spinner_widget = self.get_spinner_widget()
-        if processing:
-            widget_box.pack_start(self.spinner_widget, False, False, 0)
         widget_box.pack_start(self.file_provider_widget, True, True, 0)
         widget_box.reorder_child(self.file_provider_widget, 0)
         widget_box.reorder_child(self.spinner_widget, 1)
         widget_box.show_all()
 
-    def on_source_changed(self, combobox):
+    def on_provider_changed(self, combobox):
         """Change the source to a new provider, emit a new state"""
         tree_iter = combobox.get_active_iter()
         if tree_iter is None:
@@ -149,19 +151,34 @@ class InstallerFileBox(Gtk.VBox):
         if source == self.provider:
             return
         self.provider = source
+        self.installer_file.change_provider(source)
         self.replace_file_provider_widget()
         if self.provider == "user":
             self.emit("file-unready")
+        elif self.provider == "download":
+            if self.installer_file.is_offline:
+                self.emit("file-unready")
+            else:
+                self.emit("file-ready")
         else:
             self.emit("file-ready")
+        self.update_label()
+
+    def on_processing_start(self, widget):
+        """Show a spinner while processing"""
+        self.spinner_widget.start()
+
+    def on_processing_stop(self, widget):
+        """Hide the spinner"""
+        self.spinner_widget.stop()
 
     def get_file_provider_label(self):
         """Return the label displayed before the download starts"""
         if self.provider == "user":
             box = Gtk.VBox(spacing=6)
-            label = InstallerLabel(self.installer_file.get_label())
-            label.props.can_focus = True
-            box.pack_start(label, False, False, 0)
+            self.label = InstallerLabel(self.installer_file.get_label())
+            self.label.props.can_focus = True
+            box.pack_start(self.label, False, False, 0)
             location_entry = FileChooserEntry(self.installer_file.human_url, Gtk.FileChooserAction.OPEN)
             location_entry.connect("changed", self.on_location_changed)
             location_entry.show()
@@ -172,7 +189,26 @@ class InstallerFileBox(Gtk.VBox):
                 cache_option.connect("toggled", self.on_user_file_cached)
                 box.pack_start(cache_option, False, False, 0)
             return box
-        return InstallerLabel(self.installer_file.get_label())
+        elif self.provider == "download" and self.installer_file.source_exists(SourceDownload):
+            box = Gtk.VBox(spacing=6)
+            self.label = InstallerLabel(self.installer_file.get_label())
+            self.label.props.can_focus = True
+            hbox = Gtk.HBox(spacing=6)
+            hbox.pack_start(self.label, False, False, 0)
+            hbox.pack_start(self.spinner_widget, False, False, 0)
+            box.pack_start(hbox, False, False, 0)
+            self.url_picker = UrlPicker(self.installer_file)
+            self.url_picker.connect("update-label", self.update_label)
+            self.url_picker.connect("file-ready", lambda widget: self.emit("file-ready") or False)
+            self.url_picker.connect("file-unready", lambda widget: self.emit("file-unready") or False)
+            box.pack_start(self.url_picker, False, False, 0)
+            return box
+        else:
+            box = Gtk.HBox(spacing=6)
+            self.label = InstallerLabel(self.installer_file.get_label())
+            box.pack_start(self.label, False, False, 0)
+            box.pack_start(self.spinner_widget, False, False, 0)
+            return box
 
     def get_widgets(self):
         """Return the widget with the source of the file and a way to change its source"""
@@ -187,8 +223,14 @@ class InstallerFileBox(Gtk.VBox):
         if aux_info:
             source_box.pack_start(InstallerLabel(aux_info), False, False, 0)
         source_box.pack_start(InstallerLabel(_("Source:")), False, False, 0)
-        combobox = self.get_combobox()
-        source_box.pack_start(combobox, False, False, 0)
+        self.combobox_widget = Gtk.ComboBox.new_with_model(self.get_combobox_model())
+        self.combobox_widget.set_id_column(0)
+        renderer_text = Gtk.CellRendererText()
+        self.combobox_widget.pack_start(renderer_text, True)
+        self.combobox_widget.add_attribute(renderer_text, "text", 1)
+        self.combobox_widget.connect("changed", self.on_provider_changed)
+        self.combobox_widget.set_active_id(self.provider)
+        source_box.pack_start(self.combobox_widget, False, False, 0)
         return box
 
     def get_spinner_widget(self, size=24):
@@ -259,3 +301,39 @@ class InstallerFileBox(Gtk.VBox):
     def on_steam_game_installed(self, installer):
         self.installer_file.dest_file = installer.get_steam_data_path()
         self.emit("file-available")
+
+    def update(self):
+        """Reloads the file box adds a short effect to the combobox to indicate a change to the user without their direct interaction"""
+        logger.debug("Updating source combobox for %s", self.installer_file.filename)
+        for child in self.get_children():
+            self.remove(child)
+        self.add(self.get_widgets())
+        self.replace_file_provider_widget()
+        self.update_label()
+        # This is done with the assumption of the filebox only being reloaded if a new source is added
+        # Should there ever be the need for a more dynamic approach (e.g. an URL being added instead of a source) the code below needs to be changed
+        self._user_awareness_combobox()
+
+    def update_label(self, widget=None):
+        """Update text and style of the label of the file provider widget"""
+        if not self.label:
+            return
+        self.label.set_text(self.installer_file.get_label())
+        if self.installer_file.is_offline and self.provider == "download":
+            self.label.get_style_context().add_class("label-unavailable")
+        else:
+            self.label.get_style_context().remove_class("label-unavailable")
+
+    def _user_awareness_combobox(self):
+        """Adds a short animation to the file provider widget to make the user aware of a change"""
+        self.combobox_widget.get_style_context().remove_class("combobox-shine")
+        self.combobox_widget.get_style_context().add_provider(
+            self.css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+        self.combobox_widget.get_style_context().add_class("combobox-shine")
+
+    @property
+    def selected_url(self):
+        """Returns the currently selected URL of the url picker, if applicable"""
+        if isinstance(self.url_picker, UrlPicker):
+            return self.url_picker.selected_url

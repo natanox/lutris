@@ -1,7 +1,10 @@
-from gi.repository import GObject, Gtk
+from typing import Iterator, Callable
+
+from gi.repository import GObject, Gtk, GLib
 
 from lutris.gui.installer.file_box import InstallerFileBox
-from lutris.util.jobs import AsyncCall
+from lutris.gui.widgets.url_picker import UrlPicker
+from lutris.util.jobs import AsyncCall, thread_namespace, check_stop, StopRequested
 from lutris.util.log import logger
 
 
@@ -13,6 +16,7 @@ class InstallerFilesBox(Gtk.ListBox):
     __gsignals__ = {
         "files-ready": (GObject.SIGNAL_RUN_LAST, None, (bool,)),
         "files-available": (GObject.SIGNAL_RUN_LAST, None, ()),
+        "speedtest-finished": (GObject.SIGNAL_RUN_LAST, None, ()),
     }
 
     def __init__(self):
@@ -40,6 +44,7 @@ class InstallerFilesBox(Gtk.ListBox):
             installer_file_box.connect("file-ready", self.on_file_ready)
             installer_file_box.connect("file-unready", self.on_file_unready)
             installer_file_box.connect("file-available", self.on_file_available)
+            installer_file_box.installer_file.connect("federate-speed-measured", self.on_speed_measured)
             self.installer_files_boxes[installer_file.id] = installer_file_box
             self.add(installer_file_box)
             if installer_file_box.is_ready:
@@ -122,29 +127,60 @@ class InstallerFilesBox(Gtk.ListBox):
             files.update(installer_file.get_dest_files_by_id())
         return files
 
-    def speedtest(self):
-        """Begin speedtest on all files sequentially and update the UI"""
-        domains = {}
+    def on_speed_measured(self, widget, url, speed):
+        """Propagate the measured speed to all widgets and update UI"""
+        for file_id, file_entry in self.installer_files_boxes.items():
+            if widget == file_entry.installer_file:
+                continue
+            file_entry.installer_file.on_speed_measured(widget, url, speed)
+            if isinstance(file_entry.url_picker, UrlPicker):
+                file_entry.url_picker.on_speed_measured(widget, url, speed)
 
-        def iter_files():
+    @property
+    def speedtest_required(self):
+        """Returns true if any of the file boxes are set to auto"""
+        return any(file_entry.selected_url == "|auto_fastest" for file_entry in self.installer_files_boxes.values())
+
+    def speedtest(self, all_files: bool = False):
+        """Begin speedtest sequentially and update the UI. Blocking call.
+        all_files determines if all files should be tested or only those that are selected to be picked automatically."""
+        try:
             for file_id, file_entry in self.installer_files_boxes.items():
-                if file_id not in self.available_files:
-                    if file_entry.provider == "download":
-                        if (
-                            file_entry.installer_file.domain in domains
-                        ):  # Makes sure we only run speedtest once per domain
-                            file_entry.installer_file.speed = domains[file_entry.installer_file.domain]
-                            file_entry.replace_file_provider_widget()
-                        else:
-                            file_entry.replace_file_provider_widget(processing=True)  # Display Spinner
-                            file_entry.installer_file.run_speedtest()
-                            if file_entry.installer_file.speedtest.is_file_completed:
-                                for widget in file_entry.get_children():
-                                    file_entry.remove(widget)
-                                file_entry.provider = "pga"
-                                file_entry.add(file_entry.get_widgets())
-                            else:
-                                domains[file_entry.installer_file.domain] = file_entry.installer_file.speed
-                            file_entry.replace_file_provider_widget()  # Display Result
+                with check_stop(thread_namespace.stop_request):
+                    if file_entry.provider != "download":
+                        continue
+                    elif all_files:
+                        file_entry.installer_file.run_speedtest()
+                    elif file_entry.selected_url != "|auto_fastest":
+                        continue
+                    else:
+                        file_entry.installer_file.run_speedtest()
+        except StopRequested:
+            return
 
-        AsyncCall(iter_files, None)
+    def on_speedtest_complete(self, result, error):
+        """Update the UI and selections once speedtest is complete"""
+        if error:
+            raise RuntimeError("Speedtest failed: %s" % error)
+            return
+        for file_id, file_entry in self.installer_files_boxes.items():
+            # Setting loop
+            fastest = file_entry.installer_file.speed_fastest
+            if not None in fastest and isinstance(file_entry.url_picker, UrlPicker):
+                file_entry.url_picker.change_download_source(file_entry.installer_file.speed_fastest[0])
+            else:
+                logger.error(
+                    "Fastest speed for %s could not be determined, falling back to first working source",
+                    file_entry.installer_file.filename,
+                )
+                file_entry.installer_file.select_source("|auto_available")
+            if file_entry.installer_file.cache_source_available:
+                logger.debug("File was cached, setting provider to pga")
+                file_entry.installer_file.select_source(file_entry.installer_file.cache_source.source_id)
+                file_entry.provider = "pga"
+                file_entry.update()
+
+    def availability_tests(self) -> Iterator[Callable]:
+        """Yields function calls to availability tests on all URLs."""
+        for file_id, file_entry in self.installer_files_boxes.items():
+            yield file_entry.installer_file.get_availability

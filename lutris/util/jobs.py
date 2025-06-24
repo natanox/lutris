@@ -2,10 +2,13 @@ import sys
 import threading
 import traceback
 from typing import Callable
+from contextlib import contextmanager
 
 from gi.repository import GLib
 
 from lutris.util.log import logger
+
+thread_namespace = threading.local()
 
 
 class AsyncCall(threading.Thread):
@@ -23,6 +26,7 @@ class AsyncCall(threading.Thread):
         self.start()
 
     def target(self, *a, **kw):
+        thread_namespace.stop_request = self.stop_request
         result = None
         error = None
 
@@ -34,7 +38,112 @@ class AsyncCall(threading.Thread):
             _ex_type, _ex_value, trace = sys.exc_info()
             traceback.print_tb(trace)
 
-        self.callback_task = schedule_at_idle(self.callback, result, error)
+        if not self.stop_request.is_set():
+            self.callback_task = schedule_at_idle(self.callback, result, error)
+
+
+@contextmanager
+def check_stop(stop_event: threading.Event):
+    """Context manager for active jobs to check for stop_event and raise StopRequested if set."""
+
+    def check():
+        if stop_event and stop_event.is_set():
+            raise StopRequested()
+
+    check()
+    yield
+    check()
+
+
+class StopRequested(Exception):
+    """Raised when a stop has been requested."""
+
+    pass
+
+
+class ProcessManager:
+    """This class provides a basic featureset to manage a collection of threads (utilizing AsyncCall).
+    It is intended to be used in cases were lots of subprocesses are being used within a pre-defined scope
+    that might end before the subprocesses are done."""
+
+    def __init__(self):
+        # (name: AsyncCall Object) Dictionary of tasks currently running.
+        self._active_processes = {}
+        self._process_lock = threading.Lock()
+
+    def add_job(self, func, callback=None, name: str = None, *args, **kwargs) -> str:
+        """Adds and starts a job and returns its name. If no name is provided the ID of the called function is being used."""
+
+        def _callback(r, e):
+            if callback:
+                callback(r, e)
+            self.remove_job(name)
+
+        if name is None:
+            name = id(func)
+        with self._process_lock:
+            if name in self._active_processes:
+                logger.error("Job with name '%s' already exists, dropping new job.", name)
+                return None
+            self._active_processes[name] = AsyncCall(func, _callback, *args, **kwargs)
+        return str(name)
+
+    def remove_job(self, name, send_stop_request=True, origin: str = "Undefined") -> AsyncCall:
+        """Removes a job from the queue. Returns its AsyncCall object if successful.
+        Define origin for better traceability in logs."""
+        with self._process_lock:
+            if name in self._active_processes:
+                _ref = self._active_processes[name]
+                del self._active_processes[name]
+                if send_stop_request:
+                    _ref.stop_request.set()
+                return _ref
+            return False
+
+    def remove_jobs(self, origin: str = "Undefined"):
+        """Sends stop requests to all running jobs and clears the queue.
+        Define origin for better traceability in logs."""
+        if len(self._active_processes) > 0:
+            with self._process_lock:
+                for name, thread in self._active_processes.items():
+                    logger.debug("(%s) Sending stop request to job '%s'.", origin, name)
+                    thread.stop_request.set()
+                self._active_processes.clear()
+
+    def __del__(self):
+        if sys is None:
+            # Interpreter is going down, we're done here
+            return
+        if len(self._active_processes) > 0:
+            logger.critical(
+                "ProcessManager abandoned with active processes still in the queue. This should never happen, stopping them gracefully..."
+            )
+            self.remove_jobs(origin=self.__class__.__name__)
+
+    def __len__(self):
+        """Returns the number of active processes in the queue."""
+        with self._process_lock:
+            return len(self._active_processes)
+
+    def __bool__(self):
+        """Returns True if there are active processes in the queue."""
+        with self._process_lock:
+            return len(self._active_processes) > 0
+
+    def __str__(self):
+        """Returns class name and list of names of active processes."""
+        with self._process_lock:
+            return f"{self.__class__.__name__}({list(self._active_processes.keys())})"
+
+    def __contains__(self, name):
+        """Returns True if a process with the given name is in the queue."""
+        with self._process_lock:
+            return name in self._active_processes
+
+    def __iter__(self):
+        """Returns iterator over names of active processes."""
+        with self._process_lock:
+            return iter(self._active_processes.keys())
 
 
 class IdleTask:

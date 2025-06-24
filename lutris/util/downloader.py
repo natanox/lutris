@@ -6,6 +6,8 @@ import time
 from typing import Any
 
 import requests
+import urllib.parse
+from gettext import gettext as _
 
 from lutris import __version__
 from lutris.util import jobs
@@ -32,7 +34,13 @@ class Downloader:
     (INIT, DOWNLOADING, SPEEDTEST, CANCELLED, ERROR, COMPLETED) = list(range(6))
 
     def __init__(
-        self, url: str, dest: str, overwrite: bool = False, referer: str = None, cookies: Any = None, speedtest=False
+        self,
+        url: str,
+        dest: str = None,
+        overwrite: bool = False,
+        referer: str = None,
+        cookies: Any = None,
+        speedtest=False,
     ) -> None:
         self.url: str = url
         self.dest: str = dest
@@ -53,6 +61,7 @@ class Downloader:
         # Read these after a check_progress()
         self.state = self.INIT
         self.error = None
+        self.error_code = None
         self.downloaded_size: int = 0  # Bytes
         self.full_size: int = 0  # Bytes
         self.progress_fraction: float = 0
@@ -151,7 +160,7 @@ class Downloader:
         if self.speedtest:
             self.memfile.close()
             self.memfile = None
-        if os.path.isfile(self.dest):
+        if self.dest and os.path.isfile(self.dest):
             os.remove(self.dest)
 
     def async_download(self):
@@ -163,7 +172,12 @@ class Downloader:
             response = requests.get(self.url, headers=headers, stream=True, timeout=30, cookies=self.cookies)
             if response.status_code != 200:
                 logger.info("%s returned a %s error", self.url, response.status_code)
-            response.raise_for_status()
+                self.error_code = response.status_code
+                self.on_download_failed(response.reason)
+                if self.state == self.DOWNLOADING:
+                    response.raise_for_status()
+                self.cancel()
+                return
             self.full_size = int(response.headers.get("Content-Length", "").strip() or 0)
             self.progress_event.set()
 
@@ -175,20 +189,23 @@ class Downloader:
                         self.downloaded_size += len(chunk)
                         self.file_pointer.write(chunk)
                     self.progress_event.set()
-                self.on_download_complete()
+                self.on_download_complete(True)
 
             elif self.state == self.SPEEDTEST:
+                _completed = True  # Expecting it to download fully by default
                 for chunk in response.iter_content(chunk_size=SPEEDTEST_DEFAULT_CHUNK_SIZE):
-                    if chunk:
+                    if self.state == self.CANCELLED:
+                        _completed = False
+                        break
+                    if chunk and self.memfile:
                         self.downloaded_size += len(chunk)
                         self.memfile.write(chunk)
                     if get_time() - self.start_time > SPEEDTEST_DEFAULT_DURATION:
+                        _completed = False
                         break
                     self.progress_event.set()
                 self.average_speed = self.downloaded_size / (get_time() - self.start_time)
-
-                # There surely is a better way than checking the time twice, but for now it works
-                self.on_download_complete(get_time() - self.start_time <= SPEEDTEST_DEFAULT_DURATION)
+                self.on_download_complete(_completed)
 
         except Exception as ex:
             logger.exception("Download failed: %s", ex)
@@ -209,7 +226,7 @@ class Downloader:
             return
         if self.state == self.SPEEDTEST:
             logger.debug("✔📶 %s KB/s for %s", f"{(self.average_speed / 1_000):.1f}", self.url)
-            if file_completed:
+            if file_completed and self.dest:
                 self.file_pointer.write(self.memfile.getvalue())
                 self.memfile.close()
                 self.memfile = None
@@ -217,13 +234,14 @@ class Downloader:
             logger.debug("✔⬇ Finished downloading %s", self.url)
         if not self.downloaded_size:
             logger.warning("Downloaded file is empty")
-        if not self.full_size and file_completed:
+        if file_completed:
             self.progress_fraction = 1.0
             self.progress_percentage = 100
         self.progress_event.set()
         self.state = self.COMPLETED
-        self.file_pointer.close()
-        self.file_pointer = None
+        if self.file_pointer:
+            self.file_pointer.close()
+            self.file_pointer = None
 
     def get_stats(self):
         """Calculate and store download stats."""
@@ -283,6 +301,24 @@ class Downloader:
         return "%d:%02d:%02d" % (hours, minutes, seconds)
 
     @property
-    def is_file_completed(self):
-        """Returns true if the file is fully downloaded. Mostly useful after speedtests."""
+    def is_file_completed(self) -> bool:
+        """Returns true if the file is fully downloaded."""
         return self.progress_percentage == 100
+
+
+def is_file_available(url: str, referer: str = None, timeout=10) -> bool:
+    """Returns true if a file is available on the server."""
+    if not url.startswith("http"):
+        raise ValueError("URL not HTTP/HTTPS: %s" % url)
+        return False
+    headers = {}
+    if referer:
+        headers["Referer"] = referer
+    try:
+        response = requests.head(url, headers=headers, allow_redirects=True, timeout=timeout)
+        if response.status_code != 200:
+            logger.debug("File not available (HTTP %s): %s", response.status_code, url)
+        return response.status_code == 200
+    except requests.RequestException as e:
+        logger.debug("An error occurred while checking file availability: %s", e)
+        return False

@@ -5,6 +5,7 @@ import os
 import traceback
 from gettext import gettext as _
 from typing import List
+from time import sleep
 
 from gi.repository import Gdk, Gio, GLib, Gtk
 
@@ -30,7 +31,7 @@ from lutris.installer import InstallationKind, interpreter
 from lutris.installer.errors import MissingGameDependencyError, ScriptingError
 from lutris.installer.interpreter import ScriptInterpreter
 from lutris.util import xdgshortcuts
-from lutris.util.jobs import AsyncCall
+from lutris.util.jobs import AsyncCall, check_stop, ProcessManager, thread_namespace, schedule_at_idle
 from lutris.util.linux import LINUX_SYSTEM
 from lutris.util.log import get_log_contents, logger
 from lutris.util.steam import shortcut as steam_shortcut
@@ -75,6 +76,11 @@ class InstallerWindow(ModelessDialog, DialogInstallUIDelegate, ScriptInterpreter
         self.interpreter = None
         self.installation_kind = installation_kind
         self.continue_handler = None
+
+        # Lock the continue/install button independently from ready-state of files or other conditions.
+        # All of these get reset when the user goes back to a previous page.
+        self.continue_lock = False
+        self.process_manager = ProcessManager()
 
         self.accelerators = Gtk.AccelGroup()
         self.add_accel_group(self.accelerators)
@@ -215,8 +221,29 @@ class InstallerWindow(ModelessDialog, DialogInstallUIDelegate, ScriptInterpreter
         CacheConfigurationDialog(parent=self)
 
     def on_speedtest_clicked(self, _button):
-        """Begin speedtest on all files sequentially"""
-        self.installer_files_box.speedtest()
+        """Begin speedtest on all files sequentially once no other job is running"""
+
+        def _speedtest_await():
+            """Wait for no other job to be running."""
+            # Doing it this way ensures the process manager has full control over the whole process.
+            # Eventually a cleaner implementation within the Process Manager to queue jobs might be useful.
+            while True:
+                try:
+                    with check_stop(thread_namespace.stop_request):
+                        if len(self.process_manager) == 1:
+                            self.process_manager.add_job(
+                                self.installer_files_box.speedtest,
+                                self.installer_files_box.on_speedtest_complete,
+                                name="speedtest",
+                                all_files=True,
+                            )
+                            break
+                except StopRequested:
+                    break
+                sleep(0.1)
+
+        self.speedtest_button.set_sensitive(False)
+        self.process_manager.add_job(_speedtest_await, name="speedtest_await")
 
     def on_response(self, dialog, response: Gtk.ResponseType) -> None:
         if response in (Gtk.ResponseType.CLOSE, Gtk.ResponseType.CANCEL, Gtk.ResponseType.DELETE_EVENT):
@@ -225,9 +252,12 @@ class InstallerWindow(ModelessDialog, DialogInstallUIDelegate, ScriptInterpreter
             super().on_response(dialog, response)
 
     def on_back_clicked(self, _button):
+        """End all running page-specific processes and go back to the previous page"""
+        self._reset_page_features()
         self.stack.navigate_back()
 
     def on_navigate_home(self, _accel_group, _window, _keyval, _modifier):
+        self._reset_page_features()
         self.stack.navigate_home()
 
     def on_cancel_clicked(self, _button=None):
@@ -290,6 +320,12 @@ class InstallerWindow(ModelessDialog, DialogInstallUIDelegate, ScriptInterpreter
         else:
             display_error(error, parent=self)
             self.stack.navigation_reset()
+
+    def _reset_page_features(self):
+        """Reset all page-specific features and stop all managed jobs."""
+        self.process_manager.remove_jobs(origin=self.__class__.__name__)
+        self.continue_lock = False
+        self.speedtest_button.set_sensitive(True)
 
     def set_status(self, markup):
         """Display a short status text."""
@@ -689,6 +725,13 @@ class InstallerWindow(ModelessDialog, DialogInstallUIDelegate, ScriptInterpreter
             sensitive=self.installer_files_box.is_ready,
             extra_buttons=[self.speedtest_button if self.interpreter.installer.files else None, self.source_button],
         )
+        # Idle add to make sure the page is fully loaded to avoid the rare chance of a race condition
+        schedule_at_idle(self.start_availability_tests)
+
+    def start_availability_tests(self):
+        """Start availability tests for all downloadable files"""
+        for i, item in enumerate(self.installer_files_box.availability_tests()):
+            self.process_manager.add_job(item, name=f"availability_test_{i}")
 
     def present_downloading_files_page(self):
         def on_exit_page():
@@ -701,12 +744,32 @@ class InstallerWindow(ModelessDialog, DialogInstallUIDelegate, ScriptInterpreter
 
     def on_files_ready(self, _widget, files_ready):
         """Toggle state of continue button based on ready state"""
-        self.display_install_button(self.on_files_confirmed, sensitive=files_ready)
+        if self.stack.get_current_page_name() == "installer_files":
+            self.display_install_button(
+                self.on_files_confirmed,
+                sensitive=not self.continue_lock and files_ready,
+                extra_buttons=[self.speedtest_button if self.interpreter.installer.files else None, self.source_button],
+            )
 
     def on_files_confirmed(self, _button):
         """Call this when the user confirms the install files
-        This will start the downloads.
+        This will start the speedtest (if necessary) and then download the files.
         """
+        self.continue_button.set_sensitive(False)
+        self.continue_lock = True
+        if self.installer_files_box.speedtest_required:
+            self.process_manager.add_job(self.prepare_downloads, self.on_download_prepared, name="prepare_downloads")
+        else:
+            self.on_download_prepared()
+
+    def prepare_downloads(self):
+        """Execute any necessary tasks before starting the downloads"""
+        self.installer_files_box.speedtest()
+        self.installer_files_box.on_speedtest_complete(None, None)
+
+    def on_download_prepared(self, result=None, error=None):
+        """Gets called once all confirmed files are ready to be downloaded"""
+        self.continue_lock = False
         try:
             self.installer_files_box.start_all()
             self.stack.jump_to_page(self.present_downloading_files_page)

@@ -1,0 +1,27 @@
+/* Subtle shine effect to draw user attention to a change in the combobox */
+.combobox-shine {
+    animation: shine 2s 1;
+}
+
+@keyframes shine {
+    0% {
+        box-shadow: 0 0 0 rgba(255, 255, 255, 0);
+    }
+    25% {
+        box-shadow: 0 0 15px rgba(255, 255, 255, 0.308);
+    }
+    50% {
+        box-shadow: 0 0 15px rgba(255, 255, 255, 0.1);
+    }
+    75% {
+        box-shadow: 0 0 15px rgba(255, 255, 255, 0.308);
+    }
+    100% {
+        box-shadow: 0 0 0 rgba(255, 255, 255, 0);
+    }
+}
+
+combobox.remove-arrow box > button > box > arrow {
+    opacity: 0;
+    min-width: 0;
+}

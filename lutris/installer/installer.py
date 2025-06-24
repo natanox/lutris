@@ -156,7 +156,7 @@ class LutrisInstaller:  # pylint: disable=too-many-instance-attributes
         installer_file_url = None
         if self.service:
             for file in self.script_files:
-                if file.url.startswith("N/A"):
+                if file.has_no_sources:
                     installer_file_id = file.id
                     installer_file_url = file.url
                     break
@@ -165,9 +165,10 @@ class LutrisInstaller:  # pylint: disable=too-many-instance-attributes
 
         # Run variable substitution on the URLs from the script
         for file in files:
-            file.set_url(self.interpreter._substitute(file.url))
-            if is_moddb_url(file.url):
-                file.set_url(ModDB().transform_url(file.url))
+            for source in file.sources:
+                source.url = self.interpreter._substitute(source.url)
+                if is_moddb_url(source.url):
+                    source.url = ModDB().transform_url(source.url)
 
         if installer_file_id and self.service:
             logger.info("Getting files for %s", installer_file_id)

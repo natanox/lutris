@@ -179,3 +179,9 @@ class NavigationStack(Gtk.Stack):
 
         self.set_visible_child_name(name)
         return page
+
+    def get_current_page_name(self):
+        """Returns the name of the current visible page in the stack.
+        Returns None if there is no visible page.
+        """
+        return self.get_visible_child_name()
